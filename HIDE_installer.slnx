@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="HIDE_installer.vcxproj" Id="bcdee500-6a50-4261-853a-789693bec4db" />
+</Solution>
