@@ -66,7 +66,7 @@ const std::wstring ICON_ICO_URL = L"https://github.com/niktoonion/HentaiIDE/rele
 const std::wstring ICON_JPG_URL = L"https://github.com/niktoonion/HentaiIDE/releases/download/alpha/icon.jpg"; // ← скачиваем, но не используем
 const std::wstring VERSION_TXT_URL = L"https://github.com/niktoonion/HentaiIDE/releases/download/alpha/version.txt";
 
-const std::wstring JAVA_INSTALLER_URL = L"https://javadl.oracle.com/webapps/download/AutoDL?BundleId=252907_0d06828d282343ea81775b28020a7cd3";
+const std::wstring JAVA_INSTALLER_URL = L"https://download.oracle.com/java/21/archive/jdk-21.0.10_windows-x64_bin.exe";
 
 const std::wstring CURRENT_VERSION = L"0.0.1";
 const std::wstring APP_NAME = L"HIDE";
