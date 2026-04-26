@@ -1,41 +1,14 @@
 /*
- * Copyright (C) 2026 Fedotov Vladislav Igorevich (niktoonion)
- *
- * This program is free software: you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation, either version 3 of the License, or (at your
- * option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see https://www.gnu.org/licenses/.
- *
- * SPDX-License-Identifier: GPL-3.0-or-later
+ *  HIDE Installer – исправленная версия
+ *  ---------------------------------
+ *  Основные изменения:
+ *  • Поиск установленного JDK/JRE 21 в %ProgramFiles% (и %ProgramFiles(x86)%)
+ *  • `IsJavaInstalled()` теперь проверяет найденный `javaw.exe`
+ *  • В ярлыках используется полный путь к `javaw.exe`
+ *  • Диалоговые сообщения исправлены на «Java 21`
+ *  • При обновлении (кнопка «Обновить») удаляются HIDE + Java, затем
+ *    заново устанавливается Java 21 и HIDE.
  */
-
-/********************************************************************
-*  HIDE Installer – один‑файловый Win32‑установщик
-*  -------------------------------------------------
-*  Что делает:
-*  • Скачивает HIDE.jar, icon.ico, icon.jpg и version.txt
-*  • Устанавливает программу в %ProgramFiles%\HIDE
-*  • Ярлыки (рабочий стол, меню Пуск) используют icon.ico
-*  • Прикрепляет ярлык к панели задач (taskbar‑pin)
-*  • Принудительно «pin‑ит» ярлык в раздел Pinned меню Пуск (start‑pin)
-*  • Регистрация в «Программы и компоненты» (DisplayIcon = icon.ico)
-*  • Встроенный деинсталлятор (параметр /uninstall + отдельный ярлык)
-*  • Окно установщика имеет собственную иконку‑ресурс
-*
-*  Сборка (пример):
-*      cl /EHsc /DUNICODE /D_UNICODE /O2 hide_installer.cpp ^
-*          user32.lib advapi32.lib shell32.lib ole32.lib urlmon.lib ^
-*          comctl32.lib shlwapi.lib installer.res
-*
-********************************************************************/
 
 #define UNICODE
 #define _UNICODE
@@ -49,6 +22,8 @@
 #include <string>
 #include <fstream>
 #include <thread>
+#include <algorithm>
+#include <vector>
 #include "resource.h"                     // IDI_APPICON
 
 #pragma comment(lib, "urlmon.lib")
@@ -58,8 +33,8 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
 
-// ------------------------------------------------------------------
-// Константы (можно менять)
+ // ------------------------------------------------------------------
+ // Константы (можно менять)
 
 const std::wstring JAR_URL = L"https://github.com/niktoonion/HentaiIDE/releases/download/alpha/HIDE.jar";
 const std::wstring ICON_ICO_URL = L"https://github.com/niktoonion/HentaiIDE/releases/download/alpha/icon.ico";
@@ -103,7 +78,7 @@ static std::wstring GetErrorMessage(DWORD err)
 bool DownloadFile(const std::wstring& url,
     const std::wstring& destPath)
 {
-    // Если уже есть – не скачиваем повторно
+    // Если файл уже существует – не скачиваем заново
     if (PathFileExistsW(destPath.c_str())) return true;
     HRESULT hr = URLDownloadToFileW(nullptr,
         url.c_str(),
@@ -153,19 +128,80 @@ bool IsRunningAsAdmin()
 }
 
 // ------------------------------------------------------------------
-// Java‑related
+// Поиск установленного JDK/JRE 21
 
+/*  Возвращает полный путь к javaw.exe, если в системе найден JDK/JRE 21.
+    Ищет в %ProgramFiles% и %ProgramFiles(x86)% каталоги
+    \Java\jdk-21*  и  \Java\jre-21*  (регистр не важен).
+    Если ничего не найдено – возвращает пустую строку.                */
+std::wstring FindJavaExecutable()
+{
+    std::vector<std::wstring> roots = {
+        GetKnownFolderPath(CSIDL_PROGRAM_FILES),
+        GetKnownFolderPath(CSIDL_PROGRAM_FILESX86)
+    };
+
+    for (const auto& root : roots) {
+        if (root.empty()) continue;
+        std::wstring javaRoot = root + L"\\Java";
+        if (!PathFileExistsW(javaRoot.c_str())) continue;
+
+        WIN32_FIND_DATAW ffd;
+        HANDLE hFind = FindFirstFileW((javaRoot + L"\\*").c_str(), &ffd);
+        if (hFind == INVALID_HANDLE_VALUE) continue;
+
+        do {
+            if (!(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                continue;
+
+            std::wstring name = ffd.cFileName;
+            if (name == L"." || name == L"..")
+                continue;
+
+            std::wstring lname = name;
+            std::transform(lname.begin(), lname.end(),
+                lname.begin(),
+                ::towlower);
+
+            if (lname.find(L"jdk-21") != std::wstring::npos ||
+                lname.find(L"jre-21") != std::wstring::npos)
+            {
+                std::wstring candidate = javaRoot + L"\\" + name + L"\\bin\\javaw.exe";
+                if (PathFileExistsW(candidate.c_str()))
+                {
+                    FindClose(hFind);
+                    return candidate;            // нашли!
+                }
+            }
+        } while (FindNextFileW(hFind, &ffd));
+        FindClose(hFind);
+    }
+    return L""; // не найдено
+}
+
+/*  Возвращает true, если удалось запустить javaw -version и получить код 0.
+    Для обнаружения используется полный путь, полученный `FindJavaExecutable()`. */
 bool IsJavaInstalled()
 {
+    std::wstring javaExe = FindJavaExecutable();
+    if (javaExe.empty())
+        return false;   // нет даже установленного JDK/JRE
+
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
-    BOOL ok = CreateProcessW(L"C:\\Windows\\System32\\cmd.exe",
-        (LPWSTR)L"/C java -version",
+
+    std::wstring cmd = L"\"" + javaExe + L"\" -version";
+    BOOL ok = CreateProcessW(nullptr,
+        (LPWSTR)cmd.c_str(),
         nullptr, nullptr, FALSE,
-        CREATE_NO_WINDOW, nullptr,
-        nullptr, &si, &pi);
+        CREATE_NO_WINDOW,
+        nullptr,
+        nullptr,
+        &si,
+        &pi);
     if (!ok) return false;
 
+    // Ждём максимум 5 секунд
     WaitForSingleObject(pi.hProcess, 5000);
     DWORD ec = 0;
     GetExitCodeProcess(pi.hProcess, &ec);
@@ -174,25 +210,113 @@ bool IsJavaInstalled()
     return (ec == 0);
 }
 
-// Запуск установщика JRE‑8 (если URL задан)
+/*  Запуск установщика JDK‑21 (если URL задан).
+    Возвращает true, если установщик успешно запущен и завершён.
+    Установщик запускается от имени администратора.                      */
 bool InstallJava()
 {
-    if (JAVA_INSTALLER_URL.empty()) return false;
+    if (JAVA_INSTALLER_URL.empty())
+        return false;
 
     WCHAR tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
-    std::wstring installer = std::wstring(tmp) + L"jre8_installer.exe";
+    std::wstring installer = std::wstring(tmp) + L"java_installer.exe";
 
     if (!DownloadFile(JAVA_INSTALLER_URL, installer))
         return false;
 
-    HINSTANCE rc = ShellExecuteW(nullptr,
-        L"runas",
-        installer.c_str(),
-        nullptr,
-        nullptr,
-        SW_SHOWNORMAL);
-    return (reinterpret_cast<int>(rc) > 32);
+    // Запускаем установщик с повышенными привилегиями.
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+    sei.lpVerb = L"runas";
+    sei.lpFile = installer.c_str();
+    sei.lpParameters = nullptr;          // обычный (не тихий) UI
+    sei.nShow = SW_SHOWNORMAL;
+
+    if (!ShellExecuteExW(&sei))
+        return false;
+
+    // Дождёмся завершения установщика
+    WaitForSingleObject(sei.hProcess, INFINITE);
+    CloseHandle(sei.hProcess);
+
+    // Удалим временный файл‑установщик
+    DeleteFileW(installer.c_str());
+    return true;
+}
+
+// ------------------------------------------------------------------
+// Удаление каталогов рекурсивно (нужен для Java)
+
+bool DeleteDirectoryRecursive(const std::wstring& dir)
+{
+    std::wstring pattern = dir + L"\\*";
+    WIN32_FIND_DATAW ffd;
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &ffd);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        // Папка может быть уже пустой
+        return RemoveDirectoryW(dir.c_str()) != 0;
+    }
+
+    do {
+        if (wcscmp(ffd.cFileName, L".") == 0 ||
+            wcscmp(ffd.cFileName, L"..") == 0)
+            continue;
+
+        std::wstring fullPath = dir + L"\\" + ffd.cFileName;
+        if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            DeleteDirectoryRecursive(fullPath);
+        }
+        else {
+            SetFileAttributesW(fullPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+            DeleteFileW(fullPath.c_str());
+        }
+    } while (FindNextFileW(hFind, &ffd));
+    FindClose(hFind);
+    return RemoveDirectoryW(dir.c_str()) != 0;
+}
+
+/*  Удаляем установленную Java (JDK/JRE) из %ProgramFiles%\Java
+    и %ProgramFiles(x86)%\Java (если такие каталоги есть).           */
+bool UninstallJava()
+{
+    std::vector<std::wstring> roots = {
+        GetKnownFolderPath(CSIDL_PROGRAM_FILES),
+        GetKnownFolderPath(CSIDL_PROGRAM_FILESX86)
+    };
+    bool anyRemoved = false;
+
+    for (const auto& root : roots) {
+        if (root.empty()) continue;
+        std::wstring javaRoot = root + L"\\Java";
+        if (!PathFileExistsW(javaRoot.c_str())) continue;
+
+        WIN32_FIND_DATAW ffd;
+        HANDLE hFind = FindFirstFileW((javaRoot + L"\\*").c_str(), &ffd);
+        if (hFind == INVALID_HANDLE_VALUE) continue;
+
+        do {
+            if (!(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                continue;
+
+            std::wstring name = ffd.cFileName;
+            if (name == L"." || name == L"..") continue;
+
+            std::wstring lname = name;
+            std::transform(lname.begin(), lname.end(),
+                lname.begin(),
+                ::towlower);
+
+            if (lname.find(L"jdk-21") != std::wstring::npos ||
+                lname.find(L"jre-21") != std::wstring::npos) {
+                std::wstring fullPath = javaRoot + L"\\" + name;
+                if (DeleteDirectoryRecursive(fullPath))
+                    anyRemoved = true;
+            }
+        } while (FindNextFileW(hFind, &ffd));
+        FindClose(hFind);
+    }
+    return anyRemoved;
 }
 
 // ------------------------------------------------------------------
@@ -218,7 +342,6 @@ bool CreateShortcut(const std::wstring& target,
         if (!description.empty())
             psl->SetDescription(description.c_str());
 
-        // Указываем путь к icon.ico (для всех ярлыков)
         if (!iconPath.empty())
             psl->SetIconLocation(iconPath.c_str(), iconIdx);
 
@@ -246,7 +369,7 @@ bool PinToTaskbar(const std::wstring& shortcutPath)
     return ShellExecuteExW(&sei);
 }
 
-// Принудительное «pin‑ить» в раздел «Pinned» меню Пуск (verb "startpin")
+// Принудительное «pin‑ит» в раздел «Pinned» меню Пуск (verb "startpin")
 bool PinToStartMenu(const std::wstring& shortcutPath)
 {
     SHELLEXECUTEINFOW sei = { sizeof(sei) };
@@ -298,7 +421,6 @@ bool RegisterUninstallInfo(const std::wstring& installDir,
         (const BYTE*)uninstallCmd.c_str(),
         (DWORD)((uninstallCmd.size() + 1) * sizeof(wchar_t)));
 
-    // DisplayIcon = путь к icon.ico
     RegSetValueExW(hKey, L"DisplayIcon", 0, REG_SZ,
         (const BYTE*)iconPath.c_str(),
         (DWORD)((iconPath.size() + 1) * sizeof(wchar_t)));
@@ -339,7 +461,7 @@ bool PerformUninstall()
     std::wstring desktop = GetKnownFolderPath(CSIDL_DESKTOPDIRECTORY);
     std::wstring startMenu = GetKnownFolderPath(CSIDL_COMMON_PROGRAMS) + L"\\HIDE";
 
-    // Убираем «Pinned»‑раздел (если пользователь уже навесил)
+    // Снимаем «pin» (если пользователь уже навесил)
     UnpinFromStartMenu(startMenu + L"\\HIDE.lnk");
     UnpinFromStartMenu(startMenu + L"\\Uninstall HIDE.lnk");
 
@@ -352,7 +474,7 @@ bool PerformUninstall()
     // Удаляем файлы программы
     DeleteFileW((installDir + L"\\HIDE.jar").c_str());
     DeleteFileW((installDir + L"\\icon.ico").c_str());
-    DeleteFileW((installDir + L"\\icon.jpg").c_str());   // jpg‑файл, который мы скачали, просто стираем
+    DeleteFileW((installDir + L"\\icon.jpg").c_str());
 
     // Папка (если пустая)
     RemoveDirectoryW(installDir.c_str());
@@ -367,7 +489,11 @@ bool PerformUninstall()
 // ------------------------------------------------------------------
 // Основная операция установки
 
-bool DoInstall(HWND hProgress)
+/*  Параметр `skipJavaPrompt`:
+    * `false` – обычный режим установки; при отсутствии Java выводим запрос.
+    * `true`  – режим «обновление», когда Java только что установлена
+               (запрос не нужен).                                            */
+bool DoInstall(HWND hProgress, bool skipJavaPrompt = false)
 {
     // 1. Требуются права администратора
     if (!IsRunningAsAdmin())
@@ -383,12 +509,11 @@ bool DoInstall(HWND hProgress)
     std::wstring installDir = progFiles + L"\\HIDE";
     EnsureDirectory(installDir);
 
-    // 3. Скачиваем JAR, icon.ico и **дополнительный** icon.jpg
+    // 3. Скачиваем JAR, icon.ico и *неиспользуемый* icon.jpg
     std::wstring jarPath = installDir + L"\\HIDE.jar";
     std::wstring icoPath = installDir + L"\\icon.ico";
-    std::wstring jpgPath = installDir + L"\\icon.jpg";   // ← будет скачан, но не будет использоваться
+    std::wstring jpgPath = installDir + L"\\icon.jpg";
 
-    // Последовательные (но «параллельные» по смыслу) загрузки
     SendMessageW(hProgress, PBM_SETPOS, 0, 0);
     if (!DownloadFile(JAR_URL, jarPath))
     {
@@ -404,37 +529,51 @@ bool DoInstall(HWND hProgress)
     }
     SendMessageW(hProgress, PBM_SETPOS, 40, 0);
 
-    // Скачиваем jpg, но НЕ используем её нигде
     if (!DownloadFile(ICON_JPG_URL, jpgPath))
     {
-        MessageBoxW(nullptr, L"Не удалось скачать icon.jpg (всё равно установимся).",
+        MessageBoxW(nullptr,
+            L"Не удалось скачать icon.jpg (всё равно установимся).",
             L"Warning", MB_ICONWARNING);
-        // Ошибку можно игнорировать – она не критична
+        // Ошибку можно игнорировать.
     }
     SendMessageW(hProgress, PBM_SETPOS, 60, 0);
 
-    // 4. Проверяем наличие Java
+    // 4. Проверка/установка Java 21
     if (!IsJavaInstalled())
     {
-        int rc = MessageBoxW(nullptr,
-            L"Java 8 не найдена. Установить сейчас?",
-            L"Java not found", MB_YESNO | MB_ICONQUESTION);
-        if (rc == IDYES)
+        if (!skipJavaPrompt)
         {
-            if (!InstallJava())
-            {
-                MessageBoxW(nullptr,
-                    L"Не удалось запустить установщик Java.", L"Error", MB_ICONERROR);
-                return false;
-            }
+            int rc = MessageBoxW(nullptr,
+                L"Java 21 не найдена. Установить сейчас?",
+                L"Java not found",
+                MB_YESNO | MB_ICONQUESTION);
+            if (rc != IDYES)
+                return false;   // пользователь отказался
+        }
+
+        if (!InstallJava())
+        {
             MessageBoxW(nullptr,
-                L"После установки Java запустите установщик ещё раз.", L"Info", MB_ICONINFORMATION);
-            return true;    // пользователь должен перезапустить установщик
+                L"Не удалось установить Java 21.", L"Error", MB_ICONERROR);
+            return false;
+        }
+
+        // Даем системе шанс «распознать» только‑что установленную Java.
+        // Если после установки всё равно не найдена – выводим сообщение.
+        if (!IsJavaInstalled())
+        {
+            MessageBoxW(nullptr,
+                L"Java 21 по‑прежнему не найдена после установки.",
+                L"Error", MB_ICONERROR);
+            return false;
         }
     }
 
-    // 5. Ярлыки (везде указываем путь к icon.ico)
-    std::wstring javaExe = L"javaw.exe";
+    // 5. Путь к javaw.exe (полный, гарантирует работу)
+    std::wstring javaExe = FindJavaExecutable();
+    if (javaExe.empty())
+        javaExe = L"javaw.exe";    // fallback – мало чем может помочь, но не упадём
+
     std::wstring args = L"-jar \"" + jarPath + L"\"";
 
     // 5.1 Ярлык на рабочем столе
@@ -443,14 +582,14 @@ bool DoInstall(HWND hProgress)
     CreateShortcut(javaExe, args, desktopLnk,
         DISPLAY_NAME, icoPath);
 
-    // 5.2 Ярлык в меню Пуск (общая папка)
+    // 5.2 Ярлык в меню Пуск (общий раздел)
     std::wstring startMenu = GetKnownFolderPath(CSIDL_COMMON_PROGRAMS) + L"\\HIDE";
     EnsureDirectory(startMenu);
     std::wstring startLnk = startMenu + L"\\HIDE.lnk";
     CreateShortcut(javaExe, args, startLnk,
         DISPLAY_NAME, icoPath);
 
-    // 5.3 Ярлык деинсталлятора (тоже с icon.ico)
+    // 5.3 Ярлык деинсталлятора
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     std::wstring uninstallLnk = startMenu + L"\\Uninstall HIDE.lnk";
@@ -461,11 +600,9 @@ bool DoInstall(HWND hProgress)
     PinToTaskbar(startLnk);
 
     // 5.5 Принудительно «pin‑им» в раздел «Pinned» меню Пуск
-    // (это делается через verb “startpin”, который не требует пользовательского подтверждения,
-    // но в редких случаях может быть отклонён системой.)
     PinToStartMenu(startLnk);
 
-    // 6. Регистрация в «Программы и компоненты» (icon.ico)
+    // 6. Регистрация в «Программы и компоненты»
     RegisterUninstallInfo(installDir, exePath, icoPath);
 
     SendMessageW(hProgress, PBM_SETPOS, 100, 0);
@@ -530,7 +667,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg,
             EnableWindow(g_hBtnInstall, FALSE);
             EnableWindow(g_hBtnUpdate, FALSE);
             EnableWindow(g_hBtnUninstall, FALSE);
-            std::thread([&] {
+            std::thread([] {
                 DoInstall(g_hProgress);
                 EnableWindow(g_hBtnInstall, TRUE);
                 EnableWindow(g_hBtnUpdate, TRUE);
@@ -540,25 +677,69 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg,
 
         case ID_BTN_UPDATE:
         {
-            std::wstring remote;
-            if (IsUpdateAvailable(remote))
-            {
-                int ans = MessageBoxW(hwnd,
-                    (L"Доступна новая версия: " + remote + L"\nОбновить сейчас?").c_str(),
-                    L"Обновление", MB_YESNO | MB_ICONQUESTION);
-                if (ans == IDYES)
-                {
-                    std::wstring progFiles = GetKnownFolderPath(CSIDL_PROGRAM_FILES);
-                    std::wstring installDir = progFiles + L"\\HIDE";
-                    std::wstring jarPath = installDir + L"\\HIDE.jar";
-                    DownloadFile(JAR_URL, jarPath);
-                    MessageBoxW(hwnd,
-                        L"Обновление завершено.", L"Info", MB_ICONINFORMATION);
+            // Отключаем кнопки – работа идёт в отдельном потоке
+            EnableWindow(g_hBtnInstall, FALSE);
+            EnableWindow(g_hBtnUpdate, FALSE);
+            EnableWindow(g_hBtnUninstall, FALSE);
+
+            std::thread([] {
+                std::wstring remote;
+                bool hasUpdate = IsUpdateAvailable(remote);
+                std::wstring msg = hasUpdate
+                    ? L"Доступна новая версия: " + remote + L".\n"
+                    : L"Установлена самая свежая версия.\n";
+
+                msg += L"Будет выполнена полная переустановка HIDE и Java 21.\nПродолжить?";
+
+                int ans = MessageBoxW(nullptr,
+                    msg.c_str(),
+                    L"Обновление",
+                    MB_YESNO | MB_ICONQUESTION);
+                if (ans != IDYES) {
+                    EnableWindow(g_hBtnInstall, TRUE);
+                    EnableWindow(g_hBtnUpdate, TRUE);
+                    EnableWindow(g_hBtnUninstall, TRUE);
+                    return;
                 }
-            }
-            else
-                MessageBoxW(hwnd,
-                    L"Установлена самая свежая версия.", L"Info", MB_ICONINFORMATION);
+
+                if (!IsRunningAsAdmin()) {
+                    MessageBoxW(nullptr,
+                        L"Для обновления требуются права администратора.",
+                        L"Error", MB_ICONERROR);
+                    EnableWindow(g_hBtnInstall, TRUE);
+                    EnableWindow(g_hBtnUpdate, TRUE);
+                    EnableWindow(g_hBtnUninstall, TRUE);
+                    return;
+                }
+
+                // 1) Удаляем HIDE
+                PerformUninstall();
+
+                // 2) Удаляем установленную Java (если что‑то осталось)
+                UninstallJava();
+
+                // 3) Устанавливаем Java 21 (без диалогов)
+                if (!InstallJava())
+                {
+                    MessageBoxW(nullptr,
+                        L"Не удалось установить Java 21.",
+                        L"Error", MB_ICONERROR);
+                    EnableWindow(g_hBtnInstall, TRUE);
+                    EnableWindow(g_hBtnUpdate, TRUE);
+                    EnableWindow(g_hBtnUninstall, TRUE);
+                    return;
+                }
+
+                // 4) Устанавливаем HIDE; запрос о Java не нужен – уже установлена
+                DoInstall(g_hProgress, true);
+
+                MessageBoxW(nullptr,
+                    L"Обновление завершено.", L"Info", MB_ICONINFORMATION);
+
+                EnableWindow(g_hBtnInstall, TRUE);
+                EnableWindow(g_hBtnUpdate, TRUE);
+                EnableWindow(g_hBtnUninstall, TRUE);
+                }).detach();
         }
         break;
 
